@@ -122,3 +122,55 @@ func TestHandshakeGivesUp(t *testing.T) {
 		t.Errorf("server sent %d messages, want SEND and %d REJECTs", len(got), deviceTypeTries-1)
 	}
 }
+
+// A client far enough away that its WILL TN3270E arrives well after the
+// DO went out must still get TN3270E, not be handed to plain-TN3270
+// negotiation with its reply still in flight.
+func TestNegotiateSlowClient(t *testing.T) {
+	server, cl := net.Pipe()
+	defer server.Close() //nolint:errcheck
+	_ = cl.SetDeadline(time.Now().Add(5 * time.Second))
+
+	msgs := make(chan [][]byte, 1)
+	go func() {
+		do := make([]byte, 3)
+		if _, err := cl.Read(do); err != nil {
+			close(msgs)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+		_, _ = cl.Write([]byte{iacByte, willByte, tn3270EOption})
+		msgs <- <-client(t, cl, [][]byte{[]byte("IBM-3278-2-E")})
+	}()
+
+	_, hs, active, err := negotiateTN3270E(server, func(string) (string, error) { return "LU000001", nil })
+	if err != nil || !active || hs.luName != "LU000001" {
+		t.Fatalf("active %v, handshake %+v, %v", active, hs, err)
+	}
+	<-msgs
+}
+
+// A client that refuses TN3270E is answered as soon as its WONT arrives,
+// not after tn3270eReplyTimeout.
+func TestNegotiateRefusedPromptly(t *testing.T) {
+	server, cl := net.Pipe()
+	defer server.Close() //nolint:errcheck
+	defer cl.Close()     //nolint:errcheck
+
+	go func() {
+		do := make([]byte, 3)
+		if _, err := cl.Read(do); err != nil {
+			return
+		}
+		_, _ = cl.Write([]byte{iacByte, wontByte, tn3270EOption})
+	}()
+
+	start := time.Now()
+	_, _, active, err := negotiateTN3270E(server, func(string) (string, error) { return "LU000001", nil })
+	if err != nil || active {
+		t.Fatalf("active %v, %v", active, err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("took %v to accept a refusal", took)
+	}
+}

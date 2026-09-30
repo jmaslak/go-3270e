@@ -64,7 +64,7 @@ func negotiateTN3270E(conn net.Conn, choose LUChooser) (result net.Conn, hs hand
 		return conn, hs, false, werr
 	}
 
-	buf := drainAvailable(conn, 50*time.Millisecond, 20*time.Millisecond)
+	buf := readTN3270EReply(conn)
 
 	offered := false
 	var earlyDeviceTypeRequest []byte

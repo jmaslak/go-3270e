@@ -35,6 +35,47 @@ func (c *prefixConn) Read(p []byte) (int, error) {
 	return c.Conn.Read(p)
 }
 
+// tn3270eReplyTimeout bounds how long readTN3270EReply waits for the client
+// to answer DO TN3270E. It has to comfortably exceed a WAN round trip: a
+// reply that arrives after we've given up lands in the middle of
+// go3270.NegotiateTelnet's own negotiation and breaks it.
+const tn3270eReplyTimeout = 3 * time.Second
+
+// readTN3270EReply reads until the client has said something about telnet
+// option 40 (WILL, WONT, DO or DONT), or tn3270eReplyTimeout passes, then
+// picks up anything bundled right behind it (e.g. dx3270's early
+// DEVICE-TYPE REQUEST). Clients that don't speak TN3270E normally refuse
+// it straight away, so only a client that ignores the DO entirely waits
+// out the timeout.
+func readTN3270EReply(conn net.Conn) []byte {
+	var buf []byte
+	tmp := make([]byte, 64)
+	deadline := time.Now().Add(tn3270eReplyTimeout)
+	for !hasOptionReply(buf, tn3270EOption) {
+		_ = conn.SetReadDeadline(deadline)
+		n, err := conn.Read(tmp)
+		buf = append(buf, tmp[:n]...)
+		if err != nil {
+			_ = conn.SetReadDeadline(time.Time{})
+			return buf
+		}
+	}
+	return append(buf, drainAvailable(conn, 20*time.Millisecond, 20*time.Millisecond)...)
+}
+
+// hasOptionReply reports whether buf contains IAC WILL/WONT/DO/DONT opt.
+func hasOptionReply(buf []byte, opt byte) bool {
+	for i := 0; i+2 < len(buf); i++ {
+		if buf[i] == iacByte && buf[i+2] == opt {
+			switch buf[i+1] {
+			case willByte, wontByte, doByte, dontByte:
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // drainAvailable reads whatever bytes a client sends within initial of the
 // call, then keeps coalescing any immediately-following bytes (allowing up
 // to coalesce of silence between reads) until the client stops sending.
