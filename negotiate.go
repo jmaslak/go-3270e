@@ -35,8 +35,13 @@ type Result struct {
 	TN3270E bool
 
 	// LUName is the LU name assigned to the client during TN3270E
-	// negotiation (the luName passed to Negotiate).
+	// negotiation (the luName passed to Negotiate, or the name
+	// NegotiateLU's chooser picked).
 	LUName string
+
+	// RequestedLU is the resource name the client asked to connect to
+	// during TN3270E negotiation, empty if it named none.
+	RequestedLU string
 
 	// DeviceType is the device type the client requested during TN3270E
 	// negotiation, e.g. "IBM-3278-2-E".
@@ -51,7 +56,21 @@ type Result struct {
 // A client that doesn't speak TN3270E falls back to plain TN3270; that is
 // not an error.
 func Negotiate(conn net.Conn, luName string) (Result, error) {
-	c, deviceType, active, err := negotiateTN3270E(coalescingConn{conn}, luName)
+	return NegotiateLU(conn, func(string) (string, error) { return luName, nil })
+}
+
+// LUChooser picks the LU name to assign a TN3270E client that asked to
+// connect to requested (empty if it named none), or refuses the request
+// with an error. A refused client is sent DEVICE-TYPE REJECT with reason
+// INV-NAME, and may ask again (perhaps for another name, or none), a few
+// times, before negotiation fails.
+type LUChooser func(requested string) (luName string, err error)
+
+// NegotiateLU is Negotiate, with the LU name picked by choose, given the
+// name the client asked for. Clients that do not speak TN3270E cannot ask
+// for one, and choose is not called for them.
+func NegotiateLU(conn net.Conn, choose LUChooser) (Result, error) {
+	c, hs, active, err := negotiateTN3270E(coalescingConn{conn}, choose)
 	if err != nil {
 		return Result{}, fmt.Errorf("TN3270E negotiation: %w", err)
 	}
@@ -75,8 +94,9 @@ func Negotiate(conn net.Conn, luName string) (Result, error) {
 
 	res := Result{Conn: c, DevInfo: devinfo, TN3270E: active}
 	if active {
-		res.LUName = luName
-		res.DeviceType = deviceType
+		res.LUName = hs.luName
+		res.RequestedLU = hs.requested
+		res.DeviceType = hs.deviceType
 	}
 	return res, nil
 }

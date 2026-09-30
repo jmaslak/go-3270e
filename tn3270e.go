@@ -19,15 +19,33 @@ const (
 	tnDeviceType = 2
 	tnFunctions  = 3
 	tnIs         = 4
+	tnReason     = 5
+	tnReject     = 6
 	tnRequest    = 7
 	tnSend       = 8
+
+	// reasonInvName is the DEVICE-TYPE REJECT reason code for a resource
+	// name the server will not assign (RFC 2355 SS 4.3: INV-NAME).
+	reasonInvName = 3
+
+	// deviceTypeTries is how many DEVICE-TYPE REQUESTs a client may make,
+	// each refused one being answered with REJECT, before negotiation
+	// fails.
+	deviceTypeTries = 3
 )
+
+// handshake is what the DEVICE-TYPE subnegotiation settled on.
+type handshake struct {
+	deviceType string
+	requested  string // the resource name the client asked to CONNECT to, if any
+	luName     string // the name assigned
+}
 
 // negotiateTN3270E establishes TN3270E (telnet option 40) if the client is
 // willing to speak it, then drives the DEVICE-TYPE and FUNCTIONS
-// subnegotiations to completion, assigning the connection luName rather
-// than honoring whatever resource name the client itself requested -- the
-// server has final say over the assigned device-name per RFC 2355 SS 4.3.
+// subnegotiations to completion, assigning the connection the name choose
+// picks given the resource name the client requested -- the server has
+// final say over the assigned device-name per RFC 2355 SS 4.3.
 //
 // By convention (RFC 2355 SS 4), the server offers TN3270E first, so this
 // always sends "IAC DO TN3270E" up front for a client that's waiting to be
@@ -41,9 +59,9 @@ const (
 // false and conn is returned unchanged (with any drained bytes, e.g. an
 // unprompted WILL TERMINAL-TYPE, replayed for go3270.NegotiateTelnet to
 // see).
-func negotiateTN3270E(conn net.Conn, luName string) (result net.Conn, deviceType string, active bool, err error) {
+func negotiateTN3270E(conn net.Conn, choose LUChooser) (result net.Conn, hs handshake, active bool, err error) {
 	if _, werr := conn.Write([]byte{iacByte, doByte, tn3270EOption}); werr != nil {
-		return conn, "", false, werr
+		return conn, hs, false, werr
 	}
 
 	buf := drainAvailable(conn, 50*time.Millisecond, 20*time.Millisecond)
@@ -61,7 +79,7 @@ func negotiateTN3270E(conn net.Conn, luName string) (result net.Conn, deviceType
 			case doByte:
 				// The client is asking us to also enable 40; reply WILL.
 				if _, werr := conn.Write([]byte{iacByte, willByte, tn3270EOption}); werr != nil {
-					return conn, "", false, werr
+					return conn, hs, false, werr
 				}
 				offered = true
 				i += 3
@@ -92,9 +110,9 @@ func negotiateTN3270E(conn net.Conn, luName string) (result net.Conn, deviceType
 
 	if !offered {
 		if len(kept) == 0 {
-			return conn, "", false, nil
+			return conn, hs, false, nil
 		}
-		return &prefixConn{Conn: conn, prefix: kept}, "", false, nil
+		return &prefixConn{Conn: conn, prefix: kept}, hs, false, nil
 	}
 
 	// kept holds bytes the client sent before/alongside its TN3270E offer
@@ -104,17 +122,17 @@ func negotiateTN3270E(conn net.Conn, luName string) (result net.Conn, deviceType
 	// which expects the client's actual next bytes on the wire to be its
 	// own subnegotiation reply.
 	_ = conn.SetReadDeadline(time.Now().Add(tn3270eHandshakeTimeout))
-	deviceType, handshakeErr := runTN3270EHandshake(conn, luName, earlyDeviceTypeRequest)
+	hs, handshakeErr := runTN3270EHandshake(conn, choose, earlyDeviceTypeRequest)
 	_ = conn.SetReadDeadline(time.Time{})
 	if handshakeErr != nil {
-		return conn, "", false, handshakeErr
+		return conn, hs, false, handshakeErr
 	}
 
 	result = conn
 	if len(kept) > 0 {
 		result = &prefixConn{Conn: conn, prefix: kept}
 	}
-	return result, deviceType, true, nil
+	return result, hs, true, nil
 }
 
 // runTN3270EHandshake drives the DEVICE-TYPE and FUNCTIONS subnegotiations
@@ -124,7 +142,11 @@ func negotiateTN3270E(conn net.Conn, luName string) (result net.Conn, deviceType
 // observed with dx3270, send this unprompted rather than waiting for our
 // own SEND DEVICE-TYPE) -- when set, it's used directly instead of
 // blocking on a read for a reply that already arrived and won't repeat.
-func runTN3270EHandshake(conn net.Conn, luName string, earlyDeviceTypeRequest []byte) (deviceType string, err error) {
+//
+// A request choose refuses is answered with DEVICE-TYPE REJECT (reason
+// INV-NAME), and the client may make another, up to deviceTypeTries in
+// all.
+func runTN3270EHandshake(conn net.Conn, choose LUChooser, earlyDeviceTypeRequest []byte) (hs handshake, err error) {
 	// SEND DEVICE-TYPE is the one message in this exchange where the verb
 	// (SEND) precedes the topic (DEVICE-TYPE); every other message here
 	// (DEVICE-TYPE IS/REQUEST, FUNCTIONS IS/REQUEST) puts the topic first.
@@ -132,44 +154,52 @@ func runTN3270EHandshake(conn net.Conn, luName string, earlyDeviceTypeRequest []
 	// protocol conformance -- a client that already answered will just
 	// ignore it.
 	if _, werr := conn.Write([]byte{iacByte, sbByte, tn3270EOption, tnSend, tnDeviceType, iacByte, seByte}); werr != nil {
-		return "", werr
+		return hs, werr
 	}
 
 	payload := earlyDeviceTypeRequest
-	if payload == nil {
-		var rerr error
-		payload, rerr = readTN3270ESBMessage(conn)
-		if rerr != nil {
-			return "", fmt.Errorf("device-type request: %w", rerr)
+	for try := 1; ; try++ {
+		if payload == nil {
+			var rerr error
+			payload, rerr = readTN3270ESBMessage(conn)
+			if rerr != nil {
+				return hs, fmt.Errorf("device-type request: %w", rerr)
+			}
 		}
-	}
-	if len(payload) < 2 || payload[0] != tnDeviceType || payload[1] != tnRequest {
-		return "", fmt.Errorf("unexpected device-type reply: %x", payload)
-	}
-	deviceTypeBytes := payload[2:]
-	for i, b := range deviceTypeBytes {
-		if b == tnConnect || b == tnAssociate {
-			deviceTypeBytes = deviceTypeBytes[:i]
+		if len(payload) < 2 || payload[0] != tnDeviceType || payload[1] != tnRequest {
+			return hs, fmt.Errorf("unexpected device-type reply: %x", payload)
+		}
+		hs = parseDeviceTypeRequest(payload[2:])
+		name, cerr := choose(hs.requested)
+		if cerr == nil {
+			hs.luName = name
 			break
 		}
+		if try >= deviceTypeTries {
+			return hs, fmt.Errorf("device name %q refused: %w", hs.requested, cerr)
+		}
+		reject := []byte{iacByte, sbByte, tn3270EOption, tnDeviceType, tnReject, tnReason, reasonInvName, iacByte, seByte}
+		if _, werr := conn.Write(reject); werr != nil {
+			return hs, werr
+		}
+		payload = nil
 	}
-	deviceType = string(deviceTypeBytes)
 
 	reply := []byte{iacByte, sbByte, tn3270EOption, tnDeviceType, tnIs}
-	reply = append(reply, deviceTypeBytes...)
+	reply = append(reply, []byte(hs.deviceType)...)
 	reply = append(reply, tnConnect)
-	reply = append(reply, []byte(luName)...)
+	reply = append(reply, []byte(hs.luName)...)
 	reply = append(reply, iacByte, seByte)
 	if _, werr := conn.Write(reply); werr != nil {
-		return "", werr
+		return hs, werr
 	}
 
 	payload, rerr := readTN3270ESBMessage(conn)
 	if rerr != nil {
-		return "", fmt.Errorf("functions request: %w", rerr)
+		return hs, fmt.Errorf("functions request: %w", rerr)
 	}
 	if len(payload) < 2 || payload[0] != tnFunctions || payload[1] != tnRequest {
-		return "", fmt.Errorf("unexpected functions message: %x", payload)
+		return hs, fmt.Errorf("unexpected functions message: %x", payload)
 	}
 	agreed := decideFunctions(payload[2:])
 
@@ -177,9 +207,25 @@ func runTN3270EHandshake(conn net.Conn, luName string, earlyDeviceTypeRequest []
 	reply = append(reply, agreed...)
 	reply = append(reply, iacByte, seByte)
 	if _, werr := conn.Write(reply); werr != nil {
-		return "", werr
+		return hs, werr
 	}
-	return deviceType, nil
+	return hs, nil
+}
+
+// parseDeviceTypeRequest reads the body of a DEVICE-TYPE REQUEST, after
+// its message-type bytes: the device type, then optionally CONNECT and the
+// resource name asked for, or ASSOCIATE and a device name (for a printer),
+// which is not a name asked for.
+func parseDeviceTypeRequest(body []byte) handshake {
+	for i, b := range body {
+		switch b {
+		case tnConnect:
+			return handshake{deviceType: string(body[:i]), requested: string(body[i+1:])}
+		case tnAssociate:
+			return handshake{deviceType: string(body[:i])}
+		}
+	}
+	return handshake{deviceType: string(body)}
 }
 
 // decideFunctions decides which TN3270E functions (RFC 2355 SS 5.4) this
