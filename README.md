@@ -47,6 +47,36 @@ func handle(conn net.Conn) {
 `DevInfo`, whether TN3270E was negotiated, and the assigned LU name and
 the client's requested device type (empty for plain TN3270).
 
+## Choosing the LU name
+
+A TN3270E client may ask to connect to a particular resource name. To
+decide what to assign based on that request, use `NegotiateLU` with an
+`LUChooser` instead of `Negotiate`:
+
+```go
+neg, err := tn3270e.NegotiateLU(conn, func(requested string) (string, error) {
+	switch {
+	case requested == "":
+		return nextFreeLU(), nil
+	case !validLU(requested):
+		return "", fmt.Errorf("unknown LU %q", requested)
+	case inUse(requested):
+		return "", fmt.Errorf("LU %q: %w", requested, tn3270e.ErrDeviceInUse)
+	}
+	return requested, nil
+})
+```
+
+`requested` is empty if the client named no resource. The chooser isn't
+called for plain TN3270 clients, since they can't name one.
+
+If the chooser returns an error, the client is sent DEVICE-TYPE REJECT.
+The reason is DEVICE-IN-USE if `errors.Is(err, tn3270e.ErrDeviceInUse)`,
+and INV-NAME for any other error. The client may then ask again, with
+another name or none. Negotiation fails after 3 refused requests.
+`Result.RequestedLU` holds the name the client asked for, and
+`Result.LUName` holds the name it was assigned.
+
 ## Limits
 
 - `Negotiate` fails if negotiation takes longer than 30 seconds.

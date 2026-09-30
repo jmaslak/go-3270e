@@ -3,6 +3,7 @@ package tn3270e
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -92,6 +93,26 @@ func TestHandshakeRejectsAndRetries(t *testing.T) {
 	}
 	if want := append([]byte{tnDeviceType, tnIs}, []byte("IBM-3278-2-E\x01LU000001")...); !bytes.Equal(got[2], want) {
 		t.Errorf("device-type is %q, want %q", got[2], want)
+	}
+}
+
+func TestHandshakeRejectsInUse(t *testing.T) {
+	server, cl := net.Pipe()
+	defer server.Close() //nolint:errcheck
+	_ = server.SetDeadline(time.Now().Add(5 * time.Second))
+	msgs := client(t, cl, [][]byte{[]byte("IBM-3278-2-E\x01CONSOLE"), []byte("IBM-3278-2-E")})
+
+	_, err := runTN3270EHandshake(server, func(requested string) (string, error) {
+		if requested == "CONSOLE" {
+			return "", fmt.Errorf("%q: %w", requested, ErrDeviceInUse)
+		}
+		return "LU000001", nil
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := <-msgs; len(got) < 2 || !bytes.Equal(got[1], []byte{tnDeviceType, tnReject, tnReason, reasonDeviceInUse}) {
+		t.Fatalf("server sent %x; want SEND, REJECT DEVICE-IN-USE, ...", got)
 	}
 }
 

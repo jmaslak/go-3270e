@@ -70,8 +70,9 @@ func Negotiate(conn net.Conn, luName string) (Result, error) {
 // LUChooser picks the LU name to assign a TN3270E client that asked to
 // connect to requested (empty if it named none), or refuses the request
 // with an error. A refused client is sent DEVICE-TYPE REJECT with reason
-// INV-NAME, and may ask again (perhaps for another name, or none), a few
-// times, before negotiation fails.
+// DEVICE-IN-USE if errors.Is(err, ErrDeviceInUse), else INV-NAME, and may
+// ask again (perhaps for another name, or none), a few times, before
+// negotiation fails.
 type LUChooser func(requested string) (luName string, err error)
 
 // NegotiateLU is Negotiate, with the LU name picked by choose, given the

@@ -1,6 +1,7 @@
 package tn3270e
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -24,15 +25,31 @@ const (
 	tnRequest    = 7
 	tnSend       = 8
 
-	// reasonInvName is the DEVICE-TYPE REJECT reason code for a resource
-	// name the server will not assign (RFC 2355 SS 4.3: INV-NAME).
-	reasonInvName = 3
+	// DEVICE-TYPE REJECT reason codes (RFC 2355 SS 4.3): DEVICE-IN-USE for
+	// a resource name that exists but is already connected, INV-NAME for
+	// one the server will not assign.
+	reasonDeviceInUse = 1
+	reasonInvName     = 3
 
 	// deviceTypeTries is how many DEVICE-TYPE REQUESTs a client may make,
 	// each refused one being answered with REJECT, before negotiation
 	// fails.
 	deviceTypeTries = 3
 )
+
+// ErrDeviceInUse, returned (or wrapped) by an LUChooser, refuses the
+// requested name with DEVICE-TYPE REJECT reason DEVICE-IN-USE rather than
+// INV-NAME: the name is valid, but already connected.
+var ErrDeviceInUse = errors.New("device in use")
+
+// rejectReason is the DEVICE-TYPE REJECT reason code for an LUChooser
+// error.
+func rejectReason(err error) byte {
+	if errors.Is(err, ErrDeviceInUse) {
+		return reasonDeviceInUse
+	}
+	return reasonInvName
+}
 
 // handshake is what the DEVICE-TYPE subnegotiation settled on.
 type handshake struct {
@@ -144,7 +161,7 @@ func negotiateTN3270E(conn net.Conn, choose LUChooser) (result net.Conn, hs hand
 // blocking on a read for a reply that already arrived and won't repeat.
 //
 // A request choose refuses is answered with DEVICE-TYPE REJECT (reason
-// INV-NAME), and the client may make another, up to deviceTypeTries in
+// DEVICE-IN-USE if the error is ErrDeviceInUse, else INV-NAME), and the client may make another, up to deviceTypeTries in
 // all.
 func runTN3270EHandshake(conn net.Conn, choose LUChooser, earlyDeviceTypeRequest []byte) (hs handshake, err error) {
 	// SEND DEVICE-TYPE is the one message in this exchange where the verb
@@ -178,7 +195,7 @@ func runTN3270EHandshake(conn net.Conn, choose LUChooser, earlyDeviceTypeRequest
 		if try >= deviceTypeTries {
 			return hs, fmt.Errorf("device name %q refused: %w", hs.requested, cerr)
 		}
-		reject := []byte{iacByte, sbByte, tn3270EOption, tnDeviceType, tnReject, tnReason, reasonInvName, iacByte, seByte}
+		reject := []byte{iacByte, sbByte, tn3270EOption, tnDeviceType, tnReject, tnReason, rejectReason(cerr), iacByte, seByte}
 		if _, werr := conn.Write(reject); werr != nil {
 			return hs, werr
 		}
