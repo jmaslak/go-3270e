@@ -13,6 +13,7 @@ const (
 	wontByte = 252
 	doByte   = 253
 	dontByte = 254
+	eorByte  = 239
 
 	tn3270EOption = 40 // RFC 2355; go3270 only speaks plain TN3270.
 )

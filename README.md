@@ -46,3 +46,15 @@ func handle(conn net.Conn) {
 `Negotiate` returns the connection to use from then on, go3270's
 `DevInfo`, whether TN3270E was negotiated, and the assigned LU name and
 the client's requested device type (empty for plain TN3270).
+
+## Limits
+
+- `Negotiate` fails if negotiation takes longer than 30 seconds.
+- Reads on the connection fail with `ErrRecordTooLarge` once the client
+  sends a single record (data up to IAC EOR) longer than `MaxRecordSize`
+  (512 KiB). This bounds how much go3270's `ShowScreenOpts` and friends
+  will buffer for one response. It covers any Read Modified or Read
+  Buffer reply, for every screen size go3270 supports.
+
+Connection limits, and limits on expensive work such as password
+hashing, are up to the server using this package.

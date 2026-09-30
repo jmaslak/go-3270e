@@ -19,6 +19,10 @@ import (
 // client has agreed to TN3270E.
 const tn3270eHandshakeTimeout = 5 * time.Second
 
+// negotiationTimeout bounds the whole of Negotiate, however the client
+// stalls or dribbles bytes. A variable so tests can shorten it.
+var negotiationTimeout = 30 * time.Second
+
 // Result is the outcome of a successful Negotiate.
 type Result struct {
 	// Conn is the connection to use for everything after negotiation. It
@@ -55,6 +59,10 @@ type Result struct {
 //
 // A client that doesn't speak TN3270E falls back to plain TN3270; that is
 // not an error.
+//
+// Negotiation fails if it takes longer than 30 seconds. Reads on conn and
+// on the returned Result.Conn fail with ErrRecordTooLarge once the client
+// sends a record longer than MaxRecordSize.
 func Negotiate(conn net.Conn, luName string) (Result, error) {
 	return NegotiateLU(conn, func(string) (string, error) { return luName, nil })
 }
@@ -70,7 +78,12 @@ type LUChooser func(requested string) (luName string, err error)
 // name the client asked for. Clients that do not speak TN3270E cannot ask
 // for one, and choose is not called for them.
 func NegotiateLU(conn net.Conn, choose LUChooser) (Result, error) {
-	c, hs, active, err := negotiateTN3270E(coalescingConn{conn}, choose)
+	cc := &coalescingConn{Conn: &limitConn{Conn: conn, max: MaxRecordSize}}
+	if err := cc.setCeiling(time.Now().Add(negotiationTimeout)); err != nil {
+		return Result{}, err
+	}
+
+	c, hs, active, err := negotiateTN3270E(cc, choose)
 	if err != nil {
 		return Result{}, fmt.Errorf("TN3270E negotiation: %w", err)
 	}
@@ -90,6 +103,9 @@ func NegotiateLU(conn net.Conn, choose LUChooser) (Result, error) {
 	devinfo, err := go3270.NegotiateTelnet(c)
 	if err != nil {
 		return Result{}, fmt.Errorf("telnet negotiation: %w", err)
+	}
+	if err := cc.setCeiling(time.Time{}); err != nil {
+		return Result{}, err
 	}
 
 	res := Result{Conn: c, DevInfo: devinfo, TN3270E: active}

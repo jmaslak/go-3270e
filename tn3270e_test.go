@@ -174,3 +174,106 @@ func TestNegotiateRefusedPromptly(t *testing.T) {
 		t.Errorf("took %v to accept a refusal", took)
 	}
 }
+
+func TestLimitConn(t *testing.T) {
+	record := append(bytes.Repeat([]byte{0x40}, 10), iacByte, iacByte) // escaped 0xff counts as data
+	record = append(record, iacByte, eorByte)
+	var in []byte
+	for range 3 {
+		in = append(in, record...)
+	}
+	in = append(in, bytes.Repeat([]byte{0x40}, 14)...)
+
+	c := &limitConn{Conn: fakeConn{bytes.NewReader(in)}, max: 13}
+	buf := make([]byte, 7)
+	var read int
+	var err error
+	for err == nil {
+		var n int
+		n, err = c.Read(buf)
+		read += n
+	}
+	if !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("got %v after %d bytes, want ErrRecordTooLarge", err, read)
+	}
+	if read < 3*len(record) {
+		t.Errorf("only %d bytes read before failing; records within the limit should pass", read)
+	}
+	if _, err := c.Read(buf); !errors.Is(err, ErrRecordTooLarge) {
+		t.Errorf("read after failure: %v, want ErrRecordTooLarge again", err)
+	}
+}
+
+// fakeConn is a net.Conn whose reads come from r.
+type fakeConn struct{ r *bytes.Reader }
+
+func (f fakeConn) Read(p []byte) (int, error)     { return f.r.Read(p) }
+func (fakeConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (fakeConn) Close() error                     { return nil }
+func (fakeConn) LocalAddr() net.Addr              { return nil }
+func (fakeConn) RemoteAddr() net.Addr             { return nil }
+func (fakeConn) SetDeadline(time.Time) error      { return nil }
+func (fakeConn) SetReadDeadline(time.Time) error  { return nil }
+func (fakeConn) SetWriteDeadline(time.Time) error { return nil }
+
+// A short read, which coalescingConn extends with deadlines of its own,
+// must not wipe out the deadline its caller set.
+func TestCoalescingKeepsCallerDeadline(t *testing.T) {
+	server, cl := net.Pipe()
+	defer server.Close() //nolint:errcheck
+	defer cl.Close()     //nolint:errcheck
+	go func() { _, _ = cl.Write([]byte{iacByte}) }()
+
+	c := &coalescingConn{Conn: server}
+	_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	done := make(chan error, 1)
+	go func() { done <- readFullN(c, make([]byte, 3)) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("read 3 bytes from a client that sent 1")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("caller's read deadline was lost")
+	}
+}
+
+// A client that never stops sending can't hold Negotiate past
+// negotiationTimeout.
+func TestNegotiateTimesOut(t *testing.T) {
+	defer func(d time.Duration) { negotiationTimeout = d }(negotiationTimeout)
+	negotiationTimeout = 500 * time.Millisecond
+
+	server, cl := net.Pipe()
+	defer server.Close() //nolint:errcheck
+	defer cl.Close()     //nolint:errcheck
+	go func() {
+		do := make([]byte, 3)
+		if _, err := cl.Read(do); err != nil {
+			return
+		}
+		if _, err := cl.Write([]byte{iacByte, willByte, tn3270EOption}); err != nil {
+			return
+		}
+		for {
+			time.Sleep(5 * time.Millisecond)
+			if _, err := cl.Write([]byte{0}); err != nil {
+				return
+			}
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Negotiate(server, "LU000001")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("negotiated with a client that only sent garbage")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Negotiate ignored negotiationTimeout")
+	}
+}

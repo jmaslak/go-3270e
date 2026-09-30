@@ -1,6 +1,7 @@
 package tn3270e
 
 import (
+	"errors"
 	"net"
 	"time"
 )
@@ -24,11 +25,21 @@ const coalescingConnDeadline = 200 * time.Millisecond
 // delivers across more than one Read, which the library then rejects as a
 // malformed/short response and aborts negotiation. Coalescing reads here
 // papers over that without modifying go3270.
+//
+// Coalescing needs short read deadlines of its own, so coalescingConn
+// remembers the read deadline its caller last set and puts it back
+// afterwards, instead of clearing it. It also enforces ceiling, if set: no
+// read or write deadline, including "none", is ever later than that.
+// Negotiate uses it to bound the whole negotiation, since go3270 clears
+// read deadlines as it goes.
 type coalescingConn struct {
 	net.Conn
+	deadline      time.Time // read deadline the caller last set
+	writeDeadline time.Time // write deadline the caller last set
+	ceiling       time.Time // latest deadline allowed; zero for no limit
 }
 
-func (c coalescingConn) Read(p []byte) (int, error) {
+func (c *coalescingConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if err != nil || n == 0 || n >= len(p) {
 		return n, err
@@ -36,7 +47,8 @@ func (c coalescingConn) Read(p []byte) (int, error) {
 
 	var finalErr error
 	for n < len(p) {
-		if err := c.Conn.SetReadDeadline(time.Now().Add(coalescingConnDeadline)); err != nil {
+		wait := earliest(time.Now().Add(coalescingConnDeadline), c.effectiveDeadline())
+		if err := c.Conn.SetReadDeadline(wait); err != nil {
 			break
 		}
 		more, rerr := c.Conn.Read(p[n:])
@@ -51,9 +63,105 @@ func (c coalescingConn) Read(p []byte) (int, error) {
 			break
 		}
 	}
-	_ = c.Conn.SetReadDeadline(time.Time{})
+	_ = c.Conn.SetReadDeadline(c.effectiveDeadline())
 
 	return n, finalErr
+}
+
+func (c *coalescingConn) SetReadDeadline(t time.Time) error {
+	c.deadline = t
+	return c.Conn.SetReadDeadline(c.effectiveDeadline())
+}
+
+func (c *coalescingConn) SetWriteDeadline(t time.Time) error {
+	c.writeDeadline = t
+	return c.Conn.SetWriteDeadline(earliest(t, c.ceiling))
+}
+
+func (c *coalescingConn) SetDeadline(t time.Time) error {
+	if err := c.SetWriteDeadline(t); err != nil {
+		return err
+	}
+	return c.SetReadDeadline(t)
+}
+
+// setCeiling sets the latest deadline allowed (zero for no limit).
+func (c *coalescingConn) setCeiling(t time.Time) error {
+	c.ceiling = t
+	if err := c.Conn.SetWriteDeadline(earliest(c.writeDeadline, t)); err != nil {
+		return err
+	}
+	return c.Conn.SetReadDeadline(c.effectiveDeadline())
+}
+
+func (c *coalescingConn) effectiveDeadline() time.Time {
+	return earliest(c.deadline, c.ceiling)
+}
+
+// earliest returns the earlier of a and b, where zero means no deadline.
+func earliest(a, b time.Time) time.Time {
+	if a.IsZero() || (!b.IsZero() && b.Before(a)) {
+		return b
+	}
+	return a
+}
+
+// MaxRecordSize is the most bytes a client may send in one inbound record:
+// everything up to the IAC EOR that ends it, or, before the first one,
+// everything since the connection opened.
+//
+// go3270 itself only gets field-mode Read Modified replies (AID, cursor
+// address, then an SBA order and the data of each modified field). On the
+// largest screen go3270 allows (under 16384 positions) those top out
+// around 57 KB. The extra room is for a server that sends Read Buffer: a
+// reply with typical extended attributes (color and highlighting on every
+// character, a few attribute pairs per field) runs about 8 bytes a
+// position, or 131 KB at the largest screen size. Even the pathological
+// worst, every attribute on every position at about 18 bytes a position,
+// is 295 KB there.
+const MaxRecordSize = 512 * 1024
+
+// ErrRecordTooLarge is returned by every Read on a connection whose client
+// has sent a record longer than MaxRecordSize.
+var ErrRecordTooLarge = errors.New("tn3270e: client sent a record over MaxRecordSize bytes")
+
+// limitConn fails reads once the client sends a record longer than max.
+//
+// go3270's readResponse keeps collecting field data until the client sends
+// IAC EOR, and its negotiation and our own keep reading as long as the
+// client keeps sending, so without this a client can make the server
+// buffer as much as it likes. Once tripped, every later Read fails too:
+// the connection is no longer in a state anything can make sense of.
+type limitConn struct {
+	net.Conn
+	max      int
+	count    int  // bytes of the current record so far
+	afterIAC bool // the last byte read was an unescaped IAC
+	err      error
+}
+
+func (c *limitConn) Read(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	n, err := c.Conn.Read(p)
+	for _, b := range p[:n] {
+		if c.afterIAC {
+			c.afterIAC = false
+			if b == eorByte {
+				c.count = 0
+				continue
+			}
+		} else if b == iacByte {
+			c.afterIAC = true
+		}
+		c.count++
+		if c.count > c.max {
+			c.err = ErrRecordTooLarge
+			return 0, c.err
+		}
+	}
+	return n, err
 }
 
 // tn3270eOutboundHeader is the mandatory 5-byte TN3270E message header
